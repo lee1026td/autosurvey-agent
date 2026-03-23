@@ -13,7 +13,7 @@ RAG_SYSTEM_PROMPT = """You are a helpful research assistant. Answer questions ba
 
 Rules:
 - Use ONLY information from the provided documents
-- Cite document IDs when referencing specific information
+- Cite document IDs when referencing specific information following this format: [Document_path/Document doc_id]
 - If the documents don't contain relevant information, say so clearly
 - Be concise but comprehensive
 """
@@ -37,18 +37,9 @@ class RAGSystem:
         vector_store: VectorStore,
         n_results: int = 5,
         max_context_chars: int = 12000,
-        max_embed_chars: int = 1800,
-        chunk_overlap_chars: int = 200,
+        max_embed_chars: int = 900,
+        chunk_overlap_chars: int = 120,
     ):
-        """
-        Initialize RAG system.
-
-        Args:
-            llm: LLM client for chat and embeddings
-            vector_store: Vector store for document retrieval
-            n_results: Number of documents to retrieve per query
-            max_context_chars: Maximum context length for LLM
-        """
         self.llm = llm
         self.vector_store = vector_store
         self.n_results = n_results
@@ -57,8 +48,8 @@ class RAGSystem:
         self.chunk_overlap_chars = chunk_overlap_chars
 
     def _normalize_for_embedding(self, text: str) -> str:
-        text = text.replace("\n", " ")
-        text = re.sub(r" {3,}", " ", text)
+        text = text.replace("\r\n", "\n")
+        text = re.sub(r"\n{3,}", "\n\n", text)
         return text.strip()
 
     def _chunk_text(self, text: str) -> list[str]:
@@ -80,7 +71,7 @@ class RAGSystem:
                     text.rfind(". ", start, end),
                     text.rfind(" ", start, end),
                 )
-                if split_at > start + (self.max_embed_chars // 2):
+                if split_at > start + (self.max_embed_chars // 3):
                     end = split_at + 1
 
             chunk = text[start:end].strip()
@@ -107,11 +98,13 @@ class RAGSystem:
         for chunk_index, chunk in enumerate(chunks):
             chunk_doc_id = base_doc_id if len(chunks) == 1 else f"{base_doc_id}:chunk_{chunk_index:03d}"
             chunk_metadata = dict(metadata)
-            chunk_metadata.update({
-                "parent_doc_id": base_doc_id,
-                "chunk_index": chunk_index,
-                "chunk_count": len(chunks),
-            })
+            chunk_metadata.update(
+                {
+                    "parent_doc_id": base_doc_id,
+                    "chunk_index": chunk_index,
+                    "chunk_count": len(chunks),
+                }
+            )
             doc_ids.append(chunk_doc_id)
             contents.append(chunk)
             metadatas.append(chunk_metadata)
@@ -121,16 +114,6 @@ class RAGSystem:
         summaries_dir: Path,
         index_path: Path | None = None,
     ) -> int:
-        """
-        Index document summaries into the vector store.
-
-        Args:
-            summaries_dir: Directory containing doc_*.md files
-            index_path: Optional path to index.json for metadata
-
-        Returns:
-            Number of documents indexed
-        """
         metadata_map: dict[str, dict[str, str]] = {}
         if index_path and index_path.exists():
             try:
@@ -161,7 +144,6 @@ class RAGSystem:
             doc_id = summary_file.stem.replace("doc_", "")
             content = summary_file.read_text(encoding="utf-8")
 
-            # Skip duplicates
             if "Duplicate of:" in content:
                 continue
 
@@ -178,7 +160,7 @@ class RAGSystem:
             print("[rag] No valid documents to index")
             return 0
 
-        print(f"[rag] Generating embeddings for {len(doc_ids)} documents...")
+        print(f"[rag] Generating embeddings for {len(doc_ids)} chunks...")
         embeddings = self.llm.embed_batch(contents)
 
         self.vector_store.add_documents(
@@ -188,77 +170,59 @@ class RAGSystem:
             metadatas=metadatas,
         )
 
-        print(f"[rag] Indexed {len(doc_ids)} documents")
+        print(f"[rag] Indexed {len(doc_ids)} chunks")
         return len(doc_ids)
 
     def index_all_markdown(self, base_dir: Path) -> int:
-        """
-        Index all markdown files from multiple research folders.
-
-        Searches for:
-        - base_dir/**/summary/doc_*.md
-        - base_dir/**/summary/batch_*.md
-        - base_dir/**/final.md
-
-        Args:
-            base_dir: Root directory containing research_* folders
-
-        Returns:
-            Number of documents indexed
-        """
+        """Index every .md file under base_dir recursively."""
         doc_ids: list[str] = []
         contents: list[str] = []
         metadatas: list[dict[str, Any]] = []
 
-        # Collect all md files
-        patterns = [
-            ("**/summary/doc_*.md", "doc"),
-            ("**/summary/batch_*.md", "batch"),
-            ("**/final.md", "final"),
-        ]
+        md_files = sorted(
+            p for p in base_dir.rglob("*.md")
+            if p.is_file() and "chromadb" not in p.parts and not any(part.startswith(".") for part in p.parts)
+        )
 
-        seen_paths: set[Path] = set()
-
-        for pattern, doc_type in patterns:
-            for md_file in base_dir.glob(pattern):
-                if md_file in seen_paths:
-                    continue
-                seen_paths.add(md_file)
-
-                if "_error" in md_file.stem:
-                    continue
-
-                content = md_file.read_text(encoding="utf-8")
-
-                # Skip duplicates and empty
-                if "Duplicate of:" in content or not content.strip():
-                    continue
-
-                # Create unique doc_id from path
-                rel_path = md_file.relative_to(base_dir)
-                # e.g., research_fe/summary/doc_001.md → research_fe:doc_001
-                parent_folder = rel_path.parts[0] if len(rel_path.parts) > 1 else "root"
-                doc_id = f"{parent_folder}:{md_file.stem}"
-
-                self._append_chunked_document(
-                    base_doc_id=doc_id,
-                    content=content,
-                    metadata={
-                        "type": doc_type,
-                        "source_folder": parent_folder,
-                        "file_path": str(rel_path),
-                    },
-                    doc_ids=doc_ids,
-                    contents=contents,
-                    metadatas=metadatas,
-                )
-
-        if not doc_ids:
+        if not md_files:
             print("[rag] No markdown files found to index")
             return 0
 
-        print(f"[rag] Found {len(doc_ids)} markdown files to index")
-        print(f"[rag] Generating embeddings...")
+        print(f"[rag] Found {len(md_files)} markdown files under {base_dir}")
+
+        for md_file in md_files:
+            if "_error" in md_file.stem:
+                continue
+
+            content = md_file.read_text(encoding="utf-8")
+            if "Duplicate of:" in content or not content.strip():
+                continue
+
+            rel_path = md_file.relative_to(base_dir)
+            safe_parts = [part.replace(":", "_") for part in rel_path.with_suffix("").parts]
+            base_doc_id = "/".join(safe_parts)
+            file_path = str(rel_path)
+            parent_folder = str(rel_path.parent) if str(rel_path.parent) != "." else "root"
+
+            self._append_chunked_document(
+                base_doc_id=base_doc_id,
+                content=content,
+                metadata={
+                    "type": "markdown",
+                    "source_folder": parent_folder,
+                    "file_path": file_path,
+                    "file_name": md_file.name,
+                },
+                doc_ids=doc_ids,
+                contents=contents,
+                metadatas=metadatas,
+            )
+
+        if not doc_ids:
+            print("[rag] No valid markdown files found to index")
+            return 0
+
+        print(f"[rag] Generating embeddings for {len(doc_ids)} chunks...")
         embeddings = self.llm.embed_batch(contents)
 
         self.vector_store.add_documents(
@@ -268,11 +232,10 @@ class RAGSystem:
             metadatas=metadatas,
         )
 
-        print(f"[rag] Indexed {len(doc_ids)} documents")
+        print(f"[rag] Indexed {len(doc_ids)} chunks")
         return len(doc_ids)
 
     def retrieve(self, query: str) -> list[dict[str, Any]]:
-        """Retrieve relevant documents for a query."""
         query_embedding = self.llm.embed(query)
         return self.vector_store.query(
             query_text=query,
@@ -281,30 +244,24 @@ class RAGSystem:
         )
 
     def answer(self, question: str, stream: bool = False) -> str:
-        """
-        Answer a question using retrieved documents.
-
-        Args:
-            question: User's question
-            stream: Whether to stream the response
-
-        Returns:
-            Generated answer
-        """
         retrieved = self.retrieve(question)
 
         if not retrieved:
             return self.llm.ask(
                 RAG_SYSTEM_PROMPT,
-                f"No relevant documents found. User question: {question}\n\n"
-                "Please indicate that you don't have enough information.",
+                f"No relevant documents found. User question: {question}\n\nPlease indicate that you don't have enough information.",
                 reasoning=False,
             )
 
         context_parts: list[str] = []
         total_chars = 0
         for doc in retrieved:
-            doc_text = f"[Document {doc['doc_id']}]\n{doc['content']}"
+            label = doc["metadata"].get("parent_doc_id", doc["doc_id"])
+            file_path = doc["metadata"].get("file_path", "")
+            header = f"[Document {label}]"
+            if file_path:
+                header += f" ({file_path})"
+            doc_text = f"{header}\n{doc['content']}"
             if total_chars + len(doc_text) > self.max_context_chars:
                 break
             context_parts.append(doc_text)
@@ -326,7 +283,6 @@ class RAGSystem:
         )
 
     def chat_loop(self) -> None:
-        """Run interactive chat loop."""
         doc_count = self.vector_store.get_document_count()
         print(f"\n[RAG Chat] {doc_count} documents indexed. Type 'exit' to quit.\n")
 

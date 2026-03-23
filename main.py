@@ -170,19 +170,9 @@ def run_rag_chat(args: argparse.Namespace, llm: LLMClient, output_dir: Path) -> 
         n_results=args.rag_results,
     )
 
-    summary_dir = output_dir / "summary"
-    index_path = summary_dir / "index.json"
-
     if args.reindex or vector_store.get_document_count() == 0:
-        # Detect mode: single folder vs multi folder
-        if summary_dir.exists() and any(summary_dir.glob("doc_*.md")):
-            # Single research folder mode
-            print("[info] Indexing documents from single folder...")
-            count = rag.index_documents(summary_dir, index_path)
-        else:
-            # Multi folder mode: scan for all markdown files
-            print("[info] No summary/ folder found. Scanning for all markdown files...")
-            count = rag.index_all_markdown(output_dir)
+        print("[info] Indexing all markdown files under output directory...")
+        count = rag.index_all_markdown(output_dir)
 
         if count == 0:
             print("[error] No documents were indexed. Check your folder structure.")
@@ -197,13 +187,11 @@ def main() -> None:
     args = parse_args()
     output_dir = Path(args.output_dir).expanduser().resolve()
 
-    # Auto-detect mode: no instruction + existing data → RAG only
-    summary_dir = output_dir / "summary"
-    has_summaries = summary_dir.exists() and any(summary_dir.glob("doc_*.md"))
-    has_any_markdown = any(output_dir.glob("**/summary/*.md")) or any(output_dir.glob("**/final.md"))
+    # Auto-detect mode: no instruction + existing markdown data → RAG only
+    has_any_markdown = any(output_dir.rglob("*.md"))
 
     if not args.instruction and args.phase == "all":
-        if has_summaries or has_any_markdown:
+        if has_any_markdown:
             print("[info] No instruction provided, but documents exist. Entering RAG mode.")
             args.phase = "rag"
         else:
