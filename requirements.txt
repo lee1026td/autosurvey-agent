@@ -1,0 +1,13 @@
+# AutoSurvey Agent with RAG dependencies
+
+# Core
+requests>=2.31.0
+beautifulsoup4>=4.12.0
+openai>=1.0.0
+
+# Search
+langchain-community>=0.0.20
+duckduckgo-search>=4.0.0
+
+# Vector store
+chromadb>=0.4.0
