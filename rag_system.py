@@ -18,10 +18,22 @@ Rules:
 - Be concise but comprehensive
 """
 
+QUERY_REWRITE_PROMPT = """Given the conversation history and a follow-up question, rewrite the follow-up question to be a standalone question that captures the full context.
+
+CONVERSATION HISTORY:
+{history}
+
+FOLLOW-UP QUESTION: {question}
+
+Rewrite the follow-up question as a standalone search query. Output ONLY the rewritten query, nothing else."""
+
 RAG_USER_PROMPT_TEMPLATE = """Based on the following research documents, answer the user's question.
 
 DOCUMENTS:
 {context}
+
+RECENT CONVERSATION:
+{history}
 
 USER QUESTION: {question}
 
@@ -39,6 +51,7 @@ class RAGSystem:
         max_context_chars: int = 12000,
         max_embed_chars: int = 900,
         chunk_overlap_chars: int = 120,
+        max_history_turns: int = 3,
     ):
         self.llm = llm
         self.vector_store = vector_store
@@ -46,6 +59,19 @@ class RAGSystem:
         self.max_context_chars = max_context_chars
         self.max_embed_chars = max_embed_chars
         self.chunk_overlap_chars = chunk_overlap_chars
+        self.max_history_turns = max_history_turns
+        self.chat_history: list[tuple[str, str]] = []
+
+    def _format_recent_history(self) -> str:
+        if not self.chat_history:
+            return "(No previous conversation)"
+
+        recent = self.chat_history[-self.max_history_turns :]
+        parts: list[str] = []
+        for i, (user_q, assistant_a) in enumerate(recent, start=1):
+            parts.append(f"Turn {i} User: {user_q}")
+            parts.append(f"Turn {i} Assistant: {assistant_a}")
+        return "\n".join(parts)
 
     def _normalize_for_embedding(self, text: str) -> str:
         text = text.replace("\r\n", "\n")
@@ -235,21 +261,47 @@ class RAGSystem:
         print(f"[rag] Indexed {len(doc_ids)} chunks")
         return len(doc_ids)
 
-    def retrieve(self, query: str) -> list[dict[str, Any]]:
-        query_embedding = self.llm.embed(query)
+    def _rewrite_query_with_context(self, question: str) -> str:
+        """Rewrite follow-up question as standalone query using conversation history."""
+        if not self.chat_history:
+            return question
+
+        history = self._format_recent_history()
+        rewrite_prompt = QUERY_REWRITE_PROMPT.format(history=history, question=question)
+
+        rewritten = self.llm.ask(
+            "You are a helpful assistant that rewrites questions.",
+            rewrite_prompt,
+            reasoning=False,
+        ).strip()
+
+        print(f"[rag] Rewritten query: {rewritten}")
+        return rewritten if rewritten else question
+
+    def retrieve(self, query: str, use_history: bool = True) -> list[dict[str, Any]]:
+        # Rewrite query if there's conversation history
+        search_query = self._rewrite_query_with_context(query) if use_history else query
+
+        query_embedding = self.llm.embed(search_query)
         return self.vector_store.query(
-            query_text=query,
+            query_text=search_query,
             query_embedding=query_embedding,
             n_results=self.n_results,
         )
 
     def answer(self, question: str, stream: bool = False) -> str:
         retrieved = self.retrieve(question)
+        history = self._format_recent_history()
 
         if not retrieved:
             return self.llm.ask(
                 RAG_SYSTEM_PROMPT,
-                f"No relevant documents found. User question: {question}\n\nPlease indicate that you don't have enough information.",
+                (
+                    "No relevant documents found.\n\n"
+                    f"RECENT CONVERSATION:\n{history}\n\n"
+                    f"USER QUESTION: {question}\n\n"
+                    "Please indicate that you don't have enough information."
+                ),
                 reasoning=False,
             )
 
@@ -271,6 +323,7 @@ class RAGSystem:
 
         user_prompt = RAG_USER_PROMPT_TEMPLATE.format(
             context=context,
+            history=history,
             question=question,
         )
 
@@ -301,4 +354,6 @@ class RAGSystem:
 
             print("\n[RAG Chat] Searching and generating answer...\n")
             answer = self.answer(question, stream=True)
-            print(f"\n{answer}\n")
+            self.chat_history.append((question, answer))
+            # Note: answer already printed during streaming, just add newline
+            print()

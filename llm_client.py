@@ -95,7 +95,9 @@ class LLMClient:
                 **self.SAMPLING_PARAMS,
                 extra_body=extra_body,
             )
-            text = self._consume_stream(chunks, stream_label=stream_label)
+            text = self._consume_stream(
+                chunks, stream_label=stream_label, filter_think=not reasoning
+            )
         else:
             response = self.client.chat.completions.create(
                 model=self.model,
@@ -113,6 +115,10 @@ class LLMClient:
             tag = f" [{stream_label}]" if stream_label else ""
             mode = "think" if reasoning else "no_think"
             print(f"[llm]{tag} mode={mode} elapsed={elapsed:.2f}s")
+
+        # Strip <think> tags if reasoning is disabled
+        if not reasoning:
+            text = re.sub(r"<think>.*?</think>", "", text, flags=re.DOTALL)
 
         return text.strip()
 
@@ -211,10 +217,14 @@ class LLMClient:
 
 
 
-    def _consume_stream(self, stream_iter: Any, stream_label: str = "") -> str:
+    def _consume_stream(
+        self, stream_iter: Any, stream_label: str = "", filter_think: bool = False
+    ) -> str:
         """Consume streaming response and return combined text."""
         collected_text: list[str] = []
         reasoning_chunks: list[str] = []
+        in_think_block = False
+        think_buffer = ""
 
         prefix = f"[{stream_label}] " if stream_label else ""
         print(f"[stream] {prefix}start")
@@ -227,13 +237,43 @@ class LLMClient:
             content = getattr(delta, "content", None)
             if content:
                 collected_text.append(content)
-                print(content, end="", flush=True)
+
+                # Filter out <think> blocks during streaming if requested
+                if filter_think:
+                    think_buffer += content
+                    # Process buffer to extract non-think content
+                    while True:
+                        if in_think_block:
+                            end_idx = think_buffer.find("</think>")
+                            if end_idx != -1:
+                                think_buffer = think_buffer[end_idx + 8 :]
+                                in_think_block = False
+                            else:
+                                break
+                        else:
+                            start_idx = think_buffer.find("<think>")
+                            if start_idx != -1:
+                                print(think_buffer[:start_idx], end="", flush=True)
+                                think_buffer = think_buffer[start_idx + 7 :]
+                                in_think_block = True
+                            else:
+                                # Keep potential partial tag in buffer
+                                safe_end = max(0, len(think_buffer) - 7)
+                                print(think_buffer[:safe_end], end="", flush=True)
+                                think_buffer = think_buffer[safe_end:]
+                                break
+                else:
+                    print(content, end="", flush=True)
 
             if self.stream_reasoning:
                 reasoning_text = getattr(delta, "reasoning_content", None)
                 if reasoning_text:
                     reasoning_chunks.append(reasoning_text)
                     print(reasoning_text, end="", flush=True)
+
+        # Flush remaining buffer
+        if filter_think and think_buffer and not in_think_block:
+            print(think_buffer, end="", flush=True)
 
         print("\n[stream] end")
 
